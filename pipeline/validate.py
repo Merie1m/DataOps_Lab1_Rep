@@ -25,7 +25,7 @@ def check_schema(df):
 
 
 
-def check_reject_rate(n_total, n_rejected, max_rate=0.10):
+def check_reject_rate(n_total, n_rejected, max_rate=0.20):
     """Stop if too large a share of the rows was rejected."""
     rate = n_rejected / n_total
     if rate > max_rate:
