@@ -133,3 +133,82 @@ Le collègue ne pourrait pas télécharger les objets de data-v2 depuis le remot
 * 8dedc96 Add day 2 and 3 data and report
 * 92e55ad Add pipeline, data checks and unit tests
 ```
+
+## TP3
+
+**Q1. Pourquoi charger toutes les colonnes en texte ?**
+
+Le chargement brut évite qu'une valeur inattendue, comme une quantité `deux`, provoque une erreur ou une conversion silencieuse avant les contrôles. DuckDB garde ensuite toute la valeur telle quelle pour que les règles SQL puissent la classer.
+
+**Q2. Qu'apprend-on du total naïf SQL ?**
+
+Le langage ne garantit pas la fiabilité du résultat. Le SQL naïf donne 13950.6, comme le script Python naïf, parce qu'il calcule aussi les lignes invalides et les doublons; les transformations sans tests restent fausses.
+
+**Q3. Quel avantage garde-t-on en conservant le brut ?**
+
+Une règle erronée peut être corrigée et dbt peut être relancé sur les données originales, sans devoir redemander le fichier au fournisseur ni perdre les lignes mises en quarantaine.
+
+**Q4. Que faudrait-il changer dans profiles.yml en entreprise, et où mettre le mot de passe ?**
+
+Il faudrait remplacer `type: duckdb` et `path: warehouse.duckdb` par l'adaptateur, le compte, l'entrepôt et les paramètres du système cible, par exemple Snowflake. Le mot de passe doit être placé dans une variable d'environnement ou un gestionnaire de secrets, jamais dans le fichier YAML versionné.
+
+**Q5. Pourquoi garder la commande 1013 dans stg_orders ?**
+
+Le staging ne fait que typer et réparer les colonnes. Garder la ligne permet à la couche intermédiaire de la détecter comme `invalid_date` et de la conserver dans la quarantaine avec une trace.
+
+**Q6. stg_orders est-il recalculé à chaque lecture ?**
+
+Oui, une vue enregistre la requête SQL mais ne stocke pas les données. Chaque lecture rejoue le SQL depuis la source brute, ce qui convient au staging puisqu'une modification de la source ou du SQL est visible immédiatement.
+
+**Q7. Par quoi dbt remplace-t-il {{ ref('stg_orders') }} ?**
+
+Dans le modèle compilé, dbt remplace la référence par le nom relationnel concret `main.stg_orders`, après avoir établi la dépendance entre les modèles.
+
+**Q8. Que fait row_number() pour les doublons ?**
+
+`partition by order_id order by _row_number` numérote les lignes de chaque commande selon leur position dans le fichier. La première ligne reçoit 1 et reste acceptée; les suivantes reçoivent un numéro supérieur à 1 et sont marquées `duplicate_order_id`. `_row_number` permet donc de reproduire `keep="first"`.
+
+**Q9. Où ajouter le chiffre d'affaires par produit ?**
+
+Un analyste crée un modèle SQL `models/marts/revenue_by_product.sql`. Il n'a pas besoin de modifier le code Python.
+
+**Q10. Quel test échoue si la règle 5 est supprimée ?**
+
+Le test générique `unique_orders_clean_order_id` échoue. dbt construit quand même le test sur `int_orders_checked`, puis saute `revenue_by_country` et son test unique, ainsi que les enfants dépendants. Cela empêche toute publication d'un rapport contenant des doublons.
+
+**Q11. Tableau des équivalents dbt**
+
+| Contrôle du TP1 (Python) | Son équivalent dbt |
+|---|---|
+| `check_schema` | Sources déclarées et colonnes attendues par le modèle staging |
+| Les règles 1 à 6 dans `clean_orders` | Modèle `int_orders_checked.sql` avec la règle `CASE` |
+| `check_reject_rate` | `assert_reject_rate_below_20_percent.sql` |
+| `rejected_orders.csv` | Table mart `orders_rejected` |
+| `PIPELINE STOPPED`, rien n'est publié | `dbt build` échoue avec les modèles dépendants en `SKIP` |
+
+**Q12. D'où viennent les données du test unitaire ?**
+
+Elles viennent du bloc `given` écrit dans `int_orders_checked.yml`. Elles sont fabriquées directement dans le test, sans `load_raw.py` ni CSV, donc elles restent disponibles en CI.
+
+**Q13. Quels modèles sont touchés si country arrive vide ?**
+
+Le graphe montre que `stg_orders`, `int_orders_checked`, `orders_clean`, `orders_rejected` et `revenue_by_country` sont descendants ou dépendants de la source. Sans graphe, dans 200 scripts SQL, il faudrait rechercher manuellement les références à `country` et les dépendances, ce qui prendrait beaucoup plus longtemps.
+
+**Q14. Tableau des jours 2 et 3**
+
+| | Pipeline Python (TP1) | Pipeline dbt (TP3) |
+|---|---|---|
+| Jour 2 : contrôle arrêtant la chaîne | Taux de rejet supérieur à 20 % | `assert_reject_rate_below_20_percent` |
+| Jour 3 : message d'erreur | Colonne `unit_price` manquante / renommée en `price` | `Table "src" does not have a column named "unit_price"` |
+| Rapport de la veille conservé | Aucun nouveau rapport publié | Oui, `revenue_by_country` reste à 8835.40 |
+| Code de sortie | 1 | 1 |
+
+**Q15. orders_rejected est-il problématique au jour 2 ?**
+
+Il n'est pas une copie fiable du jour 2, car dbt l'a placé en SKIP et a conservé la table du jour 1. Pour garder les rejets du jour 2 tout en bloquant le rapport, il faudrait construire une table de quarantaine avant le test de taux et la versionner ou écrire ses rejets dans un emplacement horodaté, par exemple `orders_rejected_2026-10-06`, indépendamment du mart du rapport directeur.
+
+**Dernière ligne dbt build sur le jour 1**
+
+```text
+Done. PASS=14 WARN=0 ERROR=0 SKIP=0 NO-OP=0 REUSED=0 TOTAL=14
+```
