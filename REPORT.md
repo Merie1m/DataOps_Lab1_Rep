@@ -212,3 +212,208 @@ Il n'est pas une copie fiable du jour 2, car dbt l'a placé en SKIP et a conserv
 ```text
 Done. PASS=14 WARN=0 ERROR=0 SKIP=0 NO-OP=0 REUSED=0 TOTAL=14
 ```
+
+## TP4
+
+**Objectif**
+
+Le TP4 transforme la CI en une porte de qualité qui bloque les changements de données et les erreurs de code avant leur fusion dans `main`.
+
+**Étape 0. Pourquoi la CI du TP1 est-elle insuffisante ?**
+
+La CI du TP1 lance seulement les tests Python et le pipeline sur `data/raw/orders_day1.csv`. Après le passage à DVC, ce fichier peut être absent sur une machine neuve. GitHub Actions obtient alors une erreur `FileNotFoundError`. La CI ne vérifie ni le contrat fournisseur, ni le format utilisable du fichier, ni le chiffre de référence ni la documentation dbt.
+
+**Étape 1. Échantillon et nouveaux outils**
+
+Le fichier `tests/fixtures/orders_sample.csv` contient les 35 commandes du jour 1 et est suivi par Git, contrairement aux données DVC. Il permet à GitHub Actions de rejouer exactement le résultat connu, sans dépendre du cache DVC distant.
+
+Les outils ajoutés à `requirements.txt` sont :
+
+```text
+ruff>=0.6
+pandera[pandas]>=0.24
+datacontract-cli[duckdb]>=0.10
+```
+
+Vérifications locales :
+
+```text
+ruff check .             -> All checks passed!
+python -m pytest         -> 6 passed
+dbt build                -> PASS=14 WARN=0 ERROR=0 SKIP=0
+```
+
+`datacontract-cli` utilise DuckDB 1.x. L'entrepôt construit avec DuckDB 2.x doit donc être supprimé puis reconstruit :
+
+```bash
+python -c "import duckdb; print(duckdb.__version__)"
+rm -f warehouse.duckdb warehouse.duckdb.wal
+python load_raw.py data/raw/orders_day1.csv
+dbt build
+```
+
+**Étape 2. Contrat de données**
+
+Le fichier [contracts/orders.yaml](contracts/orders.yaml) suit le standard ODCS 3.2. Il décrit :
+
+- les fichiers disponibles pour chaque serveur local ;
+- les noms et types attendus de chaque colonne ;
+- les champs obligatoires ;
+- l'équipe responsable du contrat.
+
+Il vérifie la structure du fichier, pas les règles métier dbt.
+
+Résultats des tests locaux :
+
+| Serveur | Résultat |
+|---|---|
+| `ci` | 13 contrôles passés |
+| `day2` | Les colonnes sont présentes, les prix sont une question Pandera, pas le contrat |
+| `day3` | Échec : colonne `unit_price` manquante, remplacée par `price` |
+
+Commandes utilisées :
+
+```bash
+datacontract lint contracts/orders.yaml
+datacontract test --server ci contracts/orders.yaml
+datacontract test --server day2 contracts/orders.yaml
+datacontract test --server day3 contracts/orders.yaml
+```
+
+La dernière commande renvoie le code de sortie `1`, ce qui permet à la CI d'arrêter la chaîne.
+
+**Étape 3. Pandera à l'entrée du chargement**
+
+Le schéma [pipeline/schema.py](pipeline/schema.py) impose :
+
+- `strict=True` : aucune colonne inattendue ou manquante ;
+- `coerce=True` : tentative de conversion vers les types annoncés ;
+- `nullable=False` sur `order_id` ;
+- `nullable=True` sur `customer_id` ;
+- au moins 80 % des prix compris entre `0.01` et `1000`.
+
+Pandera est une porte sur le fichier entier. Les prix aberrants isolés restent donc possibles et seront traités en quarantaine par dbt, tandis qu'une dérive généralisée comme les centimes sur le jour 2 est refusée.
+
+Résultats attendus :
+
+| Jour | Résultat | Code |
+|---|---|---|
+| Jour 1 | 35 lignes chargées | 0 |
+| Jour 2 | Refus : plus de 20 % des prix sont implausibles | 1 |
+| Jour 3 | Refus : colonne `price` en trop et `unit_price` manquante | 1 |
+
+Dans les deux cas refusés, `raw.orders` conserve les données du jour 1 : aucun chargement partiel du mauvais jour n'est effectué.
+
+**Étape 4. Rapport de régression**
+
+Le script [report_md.py](report_md.py) lit `revenue_by_country`, calcule son total et compare cette valeur à un chiffre de référence optionnel.
+
+Sur l'échantillon :
+
+```text
+| France  | 1646.50 |
+| Germany |  542.50 |
+| Italy   | 2980.40 |
+| Morocco | 2113.50 |
+| Tunisia | 1552.50 |
+
+**Total: 8835.40**
+```
+
+Vérifications :
+
+```bash
+python load_raw.py tests/fixtures/orders_sample.csv
+dbt build
+python report_md.py 8835.40  # code 0
+python report_md.py 9999      # code 1, REGRESSION
+```
+
+**Étape 5. Workflow CI en trois jobs**
+
+Le fichier [.github/workflows/ci.yml](.github/workflows/ci.yml) contient trois jobs séquentiels :
+
+```text
+lint --> python-tests --> data-quality
+```
+
+Le job `lint` exécute Ruff. Le job `python-tests` exécute les 6 tests Python. Le job `data-quality` exécute successivement :
+
+1. le test du contrat sur l'échantillon ;
+2. le chargement Pandera ;
+3. `dbt build` ;
+4. le rapport avec le chiffre de référence ;
+5. l'export de `target/run_results.json` comme artefact.
+
+Les nouvelles fonctionnalités sont :
+
+- `pull_request` : contrôle chaque proposition de modification ;
+- `push` sur `main` : contrôle chaque fusion ;
+- `needs` : un job échoué empêche les jobs suivants de démarrer ;
+- `cache: pip` : accélère les installations Python ;
+- `$GITHUB_STEP_SUMMARY` : affiche le rapport dans GitHub Actions ;
+- `upload-artifact` : conserve les résultats dbt ;
+- `if: always()` : garde les fichiers même après un échec.
+
+Résultat attendu après la fusion : les trois jobs sont verts, le résumé affiche les cinq pays et le total 8835.40, puis l'artefact `dbt-results` est téléchargeable.
+
+**Étape 6. Workflow Nightly**
+
+Le fichier [.github/workflows/nightly.yml](.github/workflows/nightly.yml) reconstruit l'échantillon chaque nuit et publie la documentation dbt.
+
+```yaml
+schedule:
+  - cron: "0 5 * * *"
+workflow_dispatch:
+```
+
+Le cron signifie 5 h 00 UTC chaque jour. `workflow_dispatch` ajoute un bouton manuel `Run workflow` dans GitHub Actions.
+
+La chaîne Nightly exécute le chargement, `dbt build`, `dbt docs generate`, puis archive le dossier `target/` sous l'artefact `dbt-docs`. Cet artefact contient `index.html` et la documentation dbt.
+
+**Étape 7. Pull request du fournisseur**
+
+Le fournisseur renomme `unit_price` en `price` dans l'échantillon.
+
+Résultat de la pull request :
+
+- `lint` vert ;
+- `python-tests` vert ;
+- `data-quality` rouge sur `Data contract on the sample` ;
+- message attendu : `Required column 'unit_price' is missing`;
+- pull request non fusionnée.
+
+Cela montre que la CI protège également contre les changements apportés aux données, même si le code Python n'a pas changé.
+
+**Étape 8. Pull request du collègue**
+
+Les modifications du collègue assouplissent la règle des quantités :
+
+- dans `pipeline/transform.py`, `> 0` devient `> -5` ;
+- dans `models/intermediate/int_orders_checked.sql`, `quantity <= 0` devient `quantity <= -5`.
+
+Résultat de la pull request :
+
+- `lint` vert ;
+- `python-tests` rouge sur `test_negative_quantity_is_rejected` ;
+- `data-quality` non lancé, à cause de `needs` ;
+- pull request non fusionnée.
+
+La porte empêche donc aussi une modification métier incorrecte.
+
+**Tableau récapitulatif des portes**
+
+| Risque | Outil | Comportement |
+|---|---|---|
+| Mauvaise convention Python | Ruff | Bloque le job `lint` |
+| Régression du code | pytest | Bloque `python-tests` |
+| Colonnes ou champs invalides | ODCS + datacontract | Bloque `data-quality` |
+| Format fichier inutilisable | Pandera | Refuse avant le chargement |
+| Modèle ou test dbt cassé | dbt build | Bloque la publication |
+| Résultat différent du jour 1 | rapport de régression | Renvoie le code 1 |
+| Nouvelle dérive pendant la nuit | workflow Nightly | Reconstruit et alerte |
+
+**À rendre**
+
+- Exécution verte du workflow CI sur `main`.
+- Exécution manuelle verte du workflow Nightly sur `main`.
